@@ -1,4 +1,4 @@
-"""diskmonger - a SpaceMonger-style disk usage visualizer.
+"""diskscape - a disk usage treemap visualizer.
 
 Usage:
     python main.py [path]
@@ -49,10 +49,10 @@ def color_for(node: Node) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-class DiskMongerApp:
+class DiskscapeApp:
     def __init__(self, root: tk.Tk, start_path: str | None):
         self.root = root
-        self.root.title("diskmonger")
+        self.root.title("diskscape")
         self.root.geometry("1100x700")
 
         self.stack: list[Node] = []  # navigation history (zoom path)
@@ -195,7 +195,7 @@ class DiskMongerApp:
 def main():
     start_path = sys.argv[1] if len(sys.argv) > 1 else None
     root = tk.Tk()
-    DiskMongerApp(root, start_path)
+    DiskscapeApp(root, start_path)
     root.mainloop()
 
 

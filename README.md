@@ -1,8 +1,7 @@
-# diskmonger
+# diskscape
 
-Een kleine, dependency-vrije SpaceMonger/WinDirStat-achtige disk usage
-visualizer in Python: een treemap die laat zien waar je schijfruimte heen
-gaat.
+Een kleine, dependency-vrije disk usage visualizer in Python: een treemap
+die laat zien waar je schijfruimte heen gaat.
 
 ## Features
 
