@@ -25,6 +25,13 @@ Controls:
     - "Back" / Backspace to go up one level.
     - Hover over a block to see its full path and size in the status bar.
     - "Rescan" to re-scan the current root from disk.
+
+Zoom animation:
+    - Zooming in animates the clicked block growing to fill the canvas
+      (its own contents laid out inside the growing rectangle).
+    - Zooming out (Back) does the reverse: the current view shrinks back
+      down into the block it occupied in the parent view.
+    - Clicks are ignored while an animation is in flight.
 """
 from __future__ import annotations
 
@@ -47,10 +54,13 @@ HEADER_H = 15           # px, height of a block's caption strip
 NEST_MARGIN = 2         # px, inset between a parent block and its nested children
 MIN_NEST_W = 50         # px, minimum block width to bother nesting children inside it
 MIN_NEST_H = 34         # px, minimum block height to bother nesting children inside it
-MAX_NEST_DEPTH = 4      # how many folder levels get drawn nested in one view
+MAX_NEST_DEPTH = 5      # how many folder levels get drawn nested in one view
 
 PROGRESS_POLL_MS = 250       # numeric progress bar / ETA refresh rate
 PREVIEW_REDRAW_MS = 500      # full canvas redraw rate while a scan is running
+
+ZOOM_ANIM_MS = 220      # total duration of a zoom in/out animation
+ZOOM_ANIM_FRAME_MS = 16 # ~60fps animation tick
 
 # Depth-based shading for directory blocks (SpaceMonger/WinDirStat-style:
 # folders get a distinct, consistent hue independent of their name so the
@@ -60,7 +70,8 @@ DIR_DEPTH_COLORS = [
     "#3d6690",  # depth 1
     "#4c7dab",  # depth 2
     "#5c95c6",  # depth 3
-    "#71addb",  # depth 4+
+    "#71addb",  # depth 4
+    "#8ac4ec",  # depth 5+
 ]
 UNSCANNED_DIR_COLOR = "#555555"
 
@@ -82,6 +93,19 @@ def human_duration(seconds: float) -> str:
         return f"{minutes}m {s}s"
     hours, m = divmod(minutes, 60)
     return f"{hours}h {m}m"
+
+
+def ease_out_cubic(t: float) -> float:
+    t = min(max(t, 0.0), 1.0)
+    return 1 - (1 - t) ** 3
+
+
+def lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
+
+
+def lerp_rect(r1: tuple[float, float, float, float], r2: tuple[float, float, float, float], t: float):
+    return tuple(lerp(a, b, t) for a, b in zip(r1, r2))
 
 
 def color_for_file(name: str) -> str:
@@ -135,9 +159,17 @@ class DiskscapeApp:
         self.root.title("diskscape")
         self.root.geometry("1100x700")
 
-        self.stack: list[Node] = []  # navigation history (zoom path)
+        # Navigation stack: list of (node, entry_rect). entry_rect is the
+        # (x, y, w, h) this node occupied in the PREVIOUS view (the view
+        # one level up) at the moment it was zoomed into - None for the
+        # root. It's the target box a zoom-out animation shrinks back
+        # into, and it's what makes the animation symmetric with zoom-in
+        # without having to re-derive a parent layout after the fact.
+        self.stack: list[tuple[Node, tuple[float, float, float, float] | None]] = []
         self.current: Node | None = None
         self.rects: list[tuple[Node, tuple[float, float, float, float]]] = []
+        self._animating = False
+        self._anim_job: str | None = None
 
         self._progress_lock = threading.Lock()
         self._latest_progress_path = ""
@@ -286,7 +318,7 @@ class DiskscapeApp:
         node = self._scan_root_holder.get("node")
         if node is not None:
             self.current = node
-            self.stack = [node]
+            self.stack = [(node, None)]
             self.redraw()
         self._schedule_preview_redraw()
 
@@ -367,26 +399,86 @@ class DiskscapeApp:
     def _on_scan_done(self, root_node: Node):
         self._scanning = False
         self._stop_progress_ui()
-        self.stack = [root_node]
+        self.stack = [(root_node, None)]
         self.current = root_node
         self.status.config(text=f"Done. {human_size(root_node.size)} total.")
         self.redraw()
 
     def rescan(self):
         if self.stack:
-            self.start_scan(self.stack[0].path)
+            self.start_scan(self.stack[0][0].path)
 
     def go_back(self):
-        if len(self.stack) > 1:
-            self.stack.pop()
-            self.current = self.stack[-1]
+        if len(self.stack) <= 1 or self._animating:
+            return
+        _current_node, entry_rect = self.stack.pop()
+        parent_node, _ = self.stack[-1]
+        if entry_rect is None:
+            self.current = parent_node
             self.redraw()
+            return
+        self._animate_zoom(
+            content_node=_current_node,
+            from_rect=self._canvas_rect(),
+            to_rect=entry_rect,
+            on_done=lambda: self._finish_navigation(parent_node),
+        )
 
     def zoom_into(self, node: Node):
-        if node.is_dir and (node.children or not node.scanned):
-            self.stack.append(node)
+        if self._animating or not (node.is_dir and (node.children or not node.scanned)):
+            return
+        entry_rect = self._rect_of(node)
+        if entry_rect is None:
+            # shouldn't happen (we only get here from a click on a drawn
+            # rect) but fall back to an instant cut if it ever does
+            self.stack.append((node, None))
             self.current = node
             self.redraw()
+            return
+        self.stack.append((node, entry_rect))
+        self._animate_zoom(
+            content_node=node,
+            from_rect=entry_rect,
+            to_rect=self._canvas_rect(),
+            on_done=lambda: self._finish_navigation(node),
+        )
+
+    def _finish_navigation(self, node: Node):
+        self.current = node
+        self.redraw()
+
+    def _canvas_rect(self) -> tuple[float, float, float, float]:
+        return (0.0, 0.0, float(self.canvas.winfo_width()), float(self.canvas.winfo_height()))
+
+    def _rect_of(self, node: Node) -> tuple[float, float, float, float] | None:
+        for n, rect in self.rects:
+            if n is node:
+                return rect
+        return None
+
+    def _animate_zoom(self, content_node: Node, from_rect, to_rect, on_done):
+        self._animating = True
+        start_time = time.monotonic()
+
+        def tick():
+            elapsed = (time.monotonic() - start_time) * 1000
+            t = ease_out_cubic(elapsed / ZOOM_ANIM_MS)
+            rect = lerp_rect(from_rect, to_rect, t)
+
+            self.canvas.delete("all")
+            self.rects = []
+            x, y, w, h = rect
+            if w > 4 and h > 4:
+                self._layout_and_draw_children(content_node, x, y, w, h, depth=0)
+
+            if elapsed >= ZOOM_ANIM_MS:
+                self._animating = False
+                self._anim_job = None
+                on_done()
+            else:
+                self._anim_job = self.root.after(ZOOM_ANIM_FRAME_MS, tick)
+
+        tick()
 
     # ---- rendering ------------------------------------------------------
 

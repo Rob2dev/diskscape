@@ -19,11 +19,12 @@ die laat zien waar je schijfruimte heen gaat.
   schijf-scan gebruikt hij het bekende "in gebruik"-totaal (via
   disk_usage) als noemer; bij een los pad zonder bekend totaal toont hij
   een indeterminate balk met verstreken tijd en bytes gescand
-- Geneste treemap, SpaceMonger/WinDirStat-stijl: submappen worden tot
-  meerdere niveaus diep getekend binnen hun oudermap (zolang er
-  plaats is), elk met een eigen naam/grootte-caption
+- Geneste treemap, SpaceMonger/WinDirStat-stijl: submappen worden tot 5
+  niveaus diep getekend binnen hun oudermap (zolang er plaats is), elk
+  met een eigen naam/grootte-caption
 - Elk zichtbaar blok - bestand of map, op elk niveau - is klikbaar: klik
-  om in die map te zoomen, Backspace / "Back" om terug te gaan
+  om in te zoomen (met een korte groei-animatie naar volledig scherm),
+  Backspace / "Back" om weer terug te krimpen naar de oudermap
 - Kleurcodering: mappen krijgen een vast blauwtintje per nesting-diepte
   (zoals SpaceMonger), bestanden krijgen een verzadigde, over de hele
   kleurencirkel gespreide kleur per extensie (stabiel per type)
