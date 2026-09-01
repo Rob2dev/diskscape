@@ -7,14 +7,28 @@ If no path is given, a disk/drive picker dialog opens listing the
 available disks (drive letters on Windows, mount points on Linux/macOS)
 so you scan a whole disk rather than browsing to a folder.
 
+Rendering:
+    - Nested treemap, SpaceMonger/WinDirStat-style: subfolders are drawn
+      inside their parent's rectangle down to MAX_NEST_DEPTH levels (as
+      long as there's room), each with its own caption header.
+    - Every visible block (file or folder, at any nesting depth) gets a
+      caption with its name and size when there's room to show one.
+    - While a scan is running, the tree is redrawn from partial data
+      every PREVIEW_REDRAW_MS milliseconds so structure appears
+      progressively instead of only after the whole disk is done.
+      Directories whose own listing isn't finished yet show "?" instead
+      of a size and get a hatched fill.
+
 Controls:
-    - Click a directory rectangle to zoom into it.
+    - Click any block (file or folder, at any depth) - directories zoom
+      in, replacing the view with that folder's contents.
     - "Back" / Backspace to go up one level.
-    - Hover over a rectangle to see its full path and size in the status bar.
+    - Hover over a block to see its full path and size in the status bar.
     - "Rescan" to re-scan the current root from disk.
 """
 from __future__ import annotations
 
+import colorsys
 import hashlib
 import os
 import sys
@@ -23,11 +37,32 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
+import scanner
 from disks import Disk, list_disks
 from scanner import Node, scan
 from treemap import squarify
 
-MIN_RECT_SIZE = 2  # px, below this we don't bother drawing/labeling
+MIN_RECT_SIZE = 2       # px, below this we don't bother drawing at all
+HEADER_H = 15           # px, height of a block's caption strip
+NEST_MARGIN = 2         # px, inset between a parent block and its nested children
+MIN_NEST_W = 50         # px, minimum block width to bother nesting children inside it
+MIN_NEST_H = 34         # px, minimum block height to bother nesting children inside it
+MAX_NEST_DEPTH = 4      # how many folder levels get drawn nested in one view
+
+PROGRESS_POLL_MS = 250       # numeric progress bar / ETA refresh rate
+PREVIEW_REDRAW_MS = 500      # full canvas redraw rate while a scan is running
+
+# Depth-based shading for directory blocks (SpaceMonger/WinDirStat-style:
+# folders get a distinct, consistent hue independent of their name so the
+# nesting structure reads at a glance; each level a bit lighter).
+DIR_DEPTH_COLORS = [
+    "#2f4f76",  # depth 0
+    "#3d6690",  # depth 1
+    "#4c7dab",  # depth 2
+    "#5c95c6",  # depth 3
+    "#71addb",  # depth 4+
+]
+UNSCANNED_DIR_COLOR = "#555555"
 
 
 def human_size(n: float) -> str:
@@ -36,21 +71,6 @@ def human_size(n: float) -> str:
             return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
-
-
-def color_for(node: Node) -> str:
-    if node.is_dir:
-        return "#3a5f8a"
-    ext = os.path.splitext(node.name)[1].lower()
-    if not ext:
-        ext = "<none>"
-    # stable hash-based color per extension so the same type is always
-    # the same color across scans/sessions
-    h = hashlib.md5(ext.encode()).hexdigest()
-    r = 90 + int(h[0:2], 16) % 140
-    g = 90 + int(h[2:4], 16) % 140
-    b = 90 + int(h[4:6], 16) % 140
-    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 def human_duration(seconds: float) -> str:
@@ -64,7 +84,49 @@ def human_duration(seconds: float) -> str:
     return f"{hours}h {m}m"
 
 
-PROGRESS_POLL_MS = 250
+def color_for_file(name: str) -> str:
+    """A distinct, saturated color per file extension.
+
+    Hue is derived from a hash of the extension and spread across the
+    full color wheel (via HSV) so different types are easy to tell apart
+    at a glance - much more varied than picking each RGB channel
+    independently from a hash, which tends to produce muddy, similar
+    grey-blues.
+    """
+    ext = os.path.splitext(name)[1].lower() or "<none>"
+    h = hashlib.md5(ext.encode()).hexdigest()
+    hue = (int(h[:4], 16) % 360) / 360.0
+    sat = 0.55 + (int(h[4:6], 16) % 30) / 100.0    # 0.55-0.85
+    val = 0.65 + (int(h[6:8], 16) % 25) / 100.0    # 0.65-0.90
+    r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+    return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+
+
+def color_for_dir(depth: int, scanned: bool) -> str:
+    if not scanned:
+        return UNSCANNED_DIR_COLOR
+    idx = min(depth, len(DIR_DEPTH_COLORS) - 1)
+    return DIR_DEPTH_COLORS[idx]
+
+
+def color_for(node: Node, depth: int = 0) -> str:
+    if node.is_dir:
+        return color_for_dir(depth, node.scanned)
+    return color_for_file(node.name)
+
+
+def sizes_with_placeholders(children: list[Node]) -> list[float]:
+    """Layout sizes for `children`, substituting a nominal size for
+    directories that have no data yet (not scanned, size==0) so they
+    still get a visible sliver in the treemap during a live preview
+    instead of vanishing (squarify can't place zero-size items).
+    """
+    known = [c.size for c in children if c.size > 0]
+    nominal = (sum(known) / len(known) * 0.15) if known else 64 * 1024
+    return [c.size if c.size > 0 else nominal for c in children]
+
+
+PROGRESS_POLL_MS = PROGRESS_POLL_MS  # keep name stable for readability below
 
 
 class DiskscapeApp:
@@ -81,9 +143,11 @@ class DiskscapeApp:
         self._latest_progress_path = ""
         self._progress_scheduled = False
         self._scan_poll_job: str | None = None
+        self._preview_job: str | None = None
         self._scan_root_holder: dict = {}
         self._scan_expected_total: int | None = None
         self._scan_start_time: float = 0.0
+        self._scanning = False
 
         self._build_ui()
 
@@ -122,7 +186,8 @@ class DiskscapeApp:
         self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8), pady=4)
         self.progress_text = ttk.Label(self.progress_frame, text="", width=42, anchor="w")
         self.progress_text.pack(side=tk.LEFT, padx=(0, 8))
-        # hidden until a scan starts; packed/unpacked in _set_scanning_ui
+        # progress_frame is hidden until a scan starts; packed/unpacked in
+        # _start_progress_ui / _stop_progress_ui
 
         self.status = ttk.Label(self.root, text="Ready", anchor="w")
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
@@ -179,6 +244,8 @@ class DiskscapeApp:
         dialog.protocol("WM_DELETE_WINDOW", cancel)
         listbox.focus_set()
 
+    # ---- scanning -----------------------------------------------------
+
     def start_scan(self, path: str):
         # If we know how much data this path represents (e.g. it's a
         # whole disk we just listed via list_disks()), use that as the
@@ -188,9 +255,11 @@ class DiskscapeApp:
 
         self.status.config(text=f"Scanning {path} ...")
         self.canvas.delete("all")
-        self._start_progress_ui(expected_total)
-
+        self._scanning = True
         self._scan_root_holder = {}
+        self._start_progress_ui(expected_total)
+        self._schedule_preview_redraw()
+
         def worker():
             root_node = scan(
                 path, progress_cb=self._on_progress, root_holder=self._scan_root_holder
@@ -207,6 +276,19 @@ class DiskscapeApp:
         except OSError:
             pass
         return None
+
+    def _schedule_preview_redraw(self):
+        self._preview_job = self.root.after(PREVIEW_REDRAW_MS, self._preview_tick)
+
+    def _preview_tick(self):
+        if not self._scanning:
+            return
+        node = self._scan_root_holder.get("node")
+        if node is not None:
+            self.current = node
+            self.stack = [node]
+            self.redraw()
+        self._schedule_preview_redraw()
 
     def _start_progress_ui(self, expected_total: int | None):
         self._scan_expected_total = expected_total
@@ -257,6 +339,9 @@ class DiskscapeApp:
         if self._scan_poll_job is not None:
             self.root.after_cancel(self._scan_poll_job)
             self._scan_poll_job = None
+        if self._preview_job is not None:
+            self.root.after_cancel(self._preview_job)
+            self._preview_job = None
         self.progress_bar.stop()
         self.progress_frame.pack_forget()
 
@@ -280,6 +365,7 @@ class DiskscapeApp:
         self.status.config(text=f"Scanning: {path}")
 
     def _on_scan_done(self, root_node: Node):
+        self._scanning = False
         self._stop_progress_ui()
         self.stack = [root_node]
         self.current = root_node
@@ -297,10 +383,26 @@ class DiskscapeApp:
             self.redraw()
 
     def zoom_into(self, node: Node):
-        if node.is_dir and node.children:
+        if node.is_dir and (node.children or not node.scanned):
             self.stack.append(node)
             self.current = node
             self.redraw()
+
+    # ---- rendering ------------------------------------------------------
+
+    def _children_of(self, node: Node) -> list[Node]:
+        """Thread-safe-ish snapshot of a node's children.
+
+        While a scan is running, another thread may still be appending to
+        node.children, so go through scanner.snapshot_children() with the
+        scan's shared lock. Once scanning is finished the tree is static
+        and a plain list() copy is enough.
+        """
+        if self._scanning:
+            lock = self._scan_root_holder.get("lock")
+            if lock is not None:
+                return scanner.snapshot_children(node, lock)
+        return list(node.children)
 
     def redraw(self):
         self.canvas.delete("all")
@@ -314,33 +416,61 @@ class DiskscapeApp:
         if w < 10 or h < 10:
             return
 
-        children = self.current.sorted_children()
-        sizes = [c.size for c in children if c.size > 0]
-        nodes = [c for c in children if c.size > 0]
-        if not sizes:
-            self.canvas.create_text(
-                w / 2, h / 2, text="(empty)", fill="white"
-            )
+        self._layout_and_draw_children(self.current, 0, 0, w, h, depth=0)
+
+    def _layout_and_draw_children(self, node: Node, x: float, y: float, w: float, h: float, depth: int):
+        children = self._children_of(node)
+        children = sorted(children, key=lambda c: c.size, reverse=True)
+        if not children:
+            if depth == 0:
+                self.canvas.create_text(
+                    self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2,
+                    text="(empty)" if node.scanned else "(scanning...)", fill="white",
+                )
             return
 
-        placed = squarify(sizes, 0, 0, w, h)
-        for node, (rx, ry, rw, rh) in zip(nodes, placed):
+        sizes = sizes_with_placeholders(children)
+        placed = squarify(sizes, x, y, w, h)
+        for child, (rx, ry, rw, rh) in zip(children, placed):
             if rw < MIN_RECT_SIZE or rh < MIN_RECT_SIZE:
                 continue
-            color = color_for(node)
-            rect_id = self.canvas.create_rectangle(
-                rx, ry, rx + rw, ry + rh, fill=color, outline="#111111"
+            self._draw_node(child, rx, ry, rw, rh, depth)
+
+    def _draw_node(self, node: Node, x: float, y: float, w: float, h: float, depth: int):
+        color = color_for(node, depth)
+        self.canvas.create_rectangle(
+            x, y, x + w, y + h, fill=color, outline="#111111"
+        )
+        self.rects.append((node, (x, y, w, h)))
+
+        if w > 30 and h > 11:
+            if node.is_dir and not node.scanned:
+                label = f"{node.name}  ?"
+            else:
+                label = f"{node.name}  {human_size(node.size)}"
+            self.canvas.create_text(
+                x + 4, y + 2, text=label, anchor="nw", fill="white",
+                font=("TkDefaultFont", 8), width=max(w - 8, 10),
             )
-            self.rects.append((node, (rx, ry, rw, rh)))
-            if rw > 40 and rh > 14:
-                label = f"{node.name}\n{human_size(node.size)}"
-                self.canvas.create_text(
-                    rx + 4, ry + 4, text=label, anchor="nw", fill="white",
-                    font=("TkDefaultFont", 8), width=max(rw - 8, 10),
-                )
+
+        if (
+            node.is_dir
+            and depth + 1 < MAX_NEST_DEPTH
+            and w >= MIN_NEST_W
+            and h >= MIN_NEST_H
+        ):
+            inner_x = x + NEST_MARGIN
+            inner_y = y + HEADER_H
+            inner_w = w - 2 * NEST_MARGIN
+            inner_h = h - HEADER_H - NEST_MARGIN
+            if inner_w > 4 and inner_h > 4:
+                self._layout_and_draw_children(node, inner_x, inner_y, inner_w, inner_h, depth + 1)
 
     def _node_at(self, x: float, y: float) -> Node | None:
-        for node, (rx, ry, rw, rh) in self.rects:
+        # Rects are appended parent-before-child, so children (deeper
+        # nesting, drawn on top) come later in the list. Walk in reverse
+        # to hit the innermost/topmost block first.
+        for node, (rx, ry, rw, rh) in reversed(self.rects):
             if rx <= x <= rx + rw and ry <= y <= ry + rh:
                 return node
         return None
@@ -354,7 +484,8 @@ class DiskscapeApp:
         node = self._node_at(event.x, event.y)
         if node:
             kind = "dir" if node.is_dir else "file"
-            self.status.config(text=f"[{kind}] {node.path}  -  {human_size(node.size)}")
+            size_text = human_size(node.size) if (node.scanned or not node.is_dir) else "? (scanning)"
+            self.status.config(text=f"[{kind}] {node.path}  -  {size_text}")
 
 
 def main():

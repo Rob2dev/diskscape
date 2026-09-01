@@ -34,9 +34,27 @@ class Node:
     size: int = 0
     children: list["Node"] = field(default_factory=list)
     parent: "Node | None" = field(default=None, repr=False, compare=False)
+    scanned: bool = False  # True once this dir's own os.scandir() listing is done
+    # NB: scanned=True does NOT mean all descendants are done - only that
+    # this node's immediate children list is final. A UI walks down the
+    # tree and treats a directory as "still growing" if scanned is False
+    # anywhere it currently cares about.
 
     def sorted_children(self) -> list["Node"]:
         return sorted(self.children, key=lambda n: n.size, reverse=True)
+
+
+def snapshot_children(node: Node, lock: threading.Lock) -> list[Node]:
+    """Return a thread-safe copy of node.children.
+
+    A plain `list(node.children)` from another thread while a worker is
+    mid-`append()` risks "list changed size during iteration" in the
+    general case, so callers reading the tree from outside the scanner
+    (a UI polling for a live preview, say) should go through this instead
+    of touching .children directly while a scan is in flight.
+    """
+    with lock:
+        return list(node.children)
 
 
 def scan(path: str, progress_cb=None, max_workers: int = DEFAULT_WORKERS, root_holder: dict | None = None) -> Node:
@@ -59,12 +77,13 @@ def scan(path: str, progress_cb=None, max_workers: int = DEFAULT_WORKERS, root_h
     path = os.path.abspath(path)
     name = os.path.basename(path) or path
     root = Node(name=name, path=path, is_dir=True)
+    size_lock = threading.Lock()
     if root_holder is not None:
         root_holder["node"] = root
+        root_holder["lock"] = size_lock
 
     work: "queue.Queue" = queue.Queue()
     work.put(root)
-    size_lock = threading.Lock()
 
     def add_size_upwards(node: Node, n: int) -> None:
         with size_lock:
@@ -79,6 +98,8 @@ def scan(path: str, progress_cb=None, max_workers: int = DEFAULT_WORKERS, root_h
         try:
             entries = list(os.scandir(node.path))
         except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+            with size_lock:
+                node.scanned = True
             return
 
         for entry in entries:
@@ -101,6 +122,9 @@ def scan(path: str, progress_cb=None, max_workers: int = DEFAULT_WORKERS, root_h
                     add_size_upwards(node, size)
             except (PermissionError, FileNotFoundError, OSError):
                 continue
+
+        with size_lock:
+            node.scanned = True
 
     def worker() -> None:
         while True:
