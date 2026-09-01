@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import time
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -52,6 +53,20 @@ def color_for(node: Node) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def human_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, s = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {s}s"
+    hours, m = divmod(minutes, 60)
+    return f"{hours}h {m}m"
+
+
+PROGRESS_POLL_MS = 250
+
+
 class DiskscapeApp:
     def __init__(self, root: tk.Tk, start_path: str | None):
         self.root = root
@@ -61,6 +76,14 @@ class DiskscapeApp:
         self.stack: list[Node] = []  # navigation history (zoom path)
         self.current: Node | None = None
         self.rects: list[tuple[Node, tuple[float, float, float, float]]] = []
+
+        self._progress_lock = threading.Lock()
+        self._latest_progress_path = ""
+        self._progress_scheduled = False
+        self._scan_poll_job: str | None = None
+        self._scan_root_holder: dict = {}
+        self._scan_expected_total: int | None = None
+        self._scan_start_time: float = 0.0
 
         self._build_ui()
 
@@ -91,6 +114,15 @@ class DiskscapeApp:
         self.canvas.bind("<Configure>", lambda e: self.redraw())
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Motion>", self.on_hover)
+
+        self.progress_frame = ttk.Frame(self.root)
+        self.progress_bar = ttk.Progressbar(
+            self.progress_frame, orient=tk.HORIZONTAL, mode="determinate", maximum=100
+        )
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8), pady=4)
+        self.progress_text = ttk.Label(self.progress_frame, text="", width=42, anchor="w")
+        self.progress_text.pack(side=tk.LEFT, padx=(0, 8))
+        # hidden until a scan starts; packed/unpacked in _set_scanning_ui
 
         self.status = ttk.Label(self.root, text="Ready", anchor="w")
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
@@ -148,20 +180,107 @@ class DiskscapeApp:
         listbox.focus_set()
 
     def start_scan(self, path: str):
+        # If we know how much data this path represents (e.g. it's a
+        # whole disk we just listed via list_disks()), use that as the
+        # denominator for a determinate progress bar + ETA. Otherwise
+        # fall back to an indeterminate "busy" bar with just elapsed time.
+        expected_total = self._expected_total_for(path)
+
         self.status.config(text=f"Scanning {path} ...")
         self.canvas.delete("all")
+        self._start_progress_ui(expected_total)
 
+        self._scan_root_holder = {}
         def worker():
-            root_node = scan(path, progress_cb=self._on_progress)
+            root_node = scan(
+                path, progress_cb=self._on_progress, root_holder=self._scan_root_holder
+            )
             self.root.after(0, lambda: self._on_scan_done(root_node))
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _expected_total_for(self, path: str) -> int | None:
+        try:
+            for d in list_disks():
+                if os.path.abspath(d.path) == os.path.abspath(path):
+                    return d.used
+        except OSError:
+            pass
+        return None
+
+    def _start_progress_ui(self, expected_total: int | None):
+        self._scan_expected_total = expected_total
+        self._scan_start_time = time.monotonic()
+        self.progress_frame.pack(side=tk.BOTTOM, fill=tk.X, before=self.status)
+
+        if expected_total:
+            self.progress_bar.config(mode="determinate", maximum=100, value=0)
+            self.progress_text.config(text=f"0% - {human_size(0)} / {human_size(expected_total)}")
+        else:
+            self.progress_bar.config(mode="indeterminate")
+            self.progress_bar.start(12)
+            self.progress_text.config(text="0 B scanned")
+
+        self._schedule_progress_poll()
+
+    def _schedule_progress_poll(self):
+        self._scan_poll_job = self.root.after(PROGRESS_POLL_MS, self._poll_scan_progress)
+
+    def _poll_scan_progress(self):
+        node = self._scan_root_holder.get("node")
+        scanned = node.size if node is not None else 0
+        elapsed = time.monotonic() - self._scan_start_time
+
+        if self._scan_expected_total:
+            pct = min(scanned / self._scan_expected_total, 1.0) * 100
+            self.progress_bar.config(value=pct)
+            eta_text = ""
+            if pct > 1 and elapsed > 1:
+                rate = scanned / elapsed  # bytes/sec
+                if rate > 0:
+                    remaining = max(self._scan_expected_total - scanned, 0)
+                    eta_text = f" - ETA {human_duration(remaining / rate)}"
+            self.progress_text.config(
+                text=(
+                    f"{pct:.0f}% - {human_size(scanned)} / "
+                    f"{human_size(self._scan_expected_total)}{eta_text}"
+                )
+            )
+        else:
+            self.progress_text.config(
+                text=f"{human_size(scanned)} scanned - {human_duration(elapsed)} elapsed"
+            )
+
+        self._schedule_progress_poll()
+
+    def _stop_progress_ui(self):
+        if self._scan_poll_job is not None:
+            self.root.after_cancel(self._scan_poll_job)
+            self._scan_poll_job = None
+        self.progress_bar.stop()
+        self.progress_frame.pack_forget()
+
     def _on_progress(self, path: str):
-        # called from the scanner thread; keep it cheap
-        self.root.after(0, lambda: self.status.config(text=f"Scanning: {path}"))
+        # Called concurrently from up to N scanner worker threads. Tkinter
+        # itself must only be touched from the main thread, so we just
+        # stash the latest path and schedule at most one pending
+        # self.root.after() call to coalesce a flood of updates into a
+        # single UI refresh instead of spamming the Tcl event queue.
+        with self._progress_lock:
+            self._latest_progress_path = path
+            if self._progress_scheduled:
+                return
+            self._progress_scheduled = True
+        self.root.after(0, self._flush_progress)
+
+    def _flush_progress(self):
+        with self._progress_lock:
+            path = self._latest_progress_path
+            self._progress_scheduled = False
+        self.status.config(text=f"Scanning: {path}")
 
     def _on_scan_done(self, root_node: Node):
+        self._stop_progress_ui()
         self.stack = [root_node]
         self.current = root_node
         self.status.config(text=f"Done. {human_size(root_node.size)} total.")

@@ -7,8 +7,13 @@ die laat zien waar je schijfruimte heen gaat.
 
 - Kies bij het opstarten een schijf/drive uit een lijst (drive letters op
   Windows, mount points op Linux/macOS) - geen folder-browser
-- Recursieve scan van de gekozen schijf (loopt in een achtergrondthread,
-  UI blijft responsief)
+- Parallelle scan: meerdere mappen tegelijk uitgelezen via een
+  thread-pool (I/O-bound syscalls laten de GIL los, dus dit helpt vooral
+  op netwerkschijven of trage disks)
+- Voortgangsbalk met percentage en ETA tijdens het scannen. Bij een
+  schijf-scan gebruikt hij het bekende "in gebruik"-totaal (via
+  disk_usage) als noemer; bij een los pad zonder bekend totaal toont hij
+  een indeterminate balk met verstreken tijd en bytes gescand
 - Squarified treemap layout (Bruls et al., 1999) - zelfgeschreven, geen
   externe dependency nodig
 - Klik op een map om erin te zoomen, Backspace / "Back" om terug te gaan
