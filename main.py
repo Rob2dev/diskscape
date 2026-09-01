@@ -3,7 +3,9 @@
 Usage:
     python main.py [path]
 
-If no path is given, a folder picker dialog opens.
+If no path is given, a disk/drive picker dialog opens listing the
+available disks (drive letters on Windows, mount points on Linux/macOS)
+so you scan a whole disk rather than browsing to a folder.
 
 Controls:
     - Click a directory rectangle to zoom into it.
@@ -18,8 +20,9 @@ import os
 import sys
 import threading
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import ttk
 
+from disks import Disk, list_disks
 from scanner import Node, scan
 from treemap import squarify
 
@@ -64,7 +67,7 @@ class DiskscapeApp:
         if start_path:
             self.start_scan(start_path)
         else:
-            self.choose_folder()
+            self.choose_disk()
 
     def _build_ui(self):
         toolbar = ttk.Frame(self.root)
@@ -73,7 +76,7 @@ class DiskscapeApp:
         self.back_btn = ttk.Button(toolbar, text="< Back", command=self.go_back)
         self.back_btn.pack(side=tk.LEFT, padx=4, pady=4)
 
-        ttk.Button(toolbar, text="Open folder...", command=self.choose_folder).pack(
+        ttk.Button(toolbar, text="Choose disk...", command=self.choose_disk).pack(
             side=tk.LEFT, padx=4, pady=4
         )
         ttk.Button(toolbar, text="Rescan", command=self.rescan).pack(
@@ -94,12 +97,55 @@ class DiskscapeApp:
 
         self.root.bind("<BackSpace>", lambda e: self.go_back())
 
-    def choose_folder(self):
-        path = filedialog.askdirectory(title="Choose a folder to scan")
-        if path:
-            self.start_scan(path)
-        elif self.current is None:
-            self.root.destroy()
+    def choose_disk(self):
+        disks = list_disks()
+        if not disks:
+            self.status.config(text="No disks detected.")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Choose a disk to scan")
+        dialog.geometry("420x320")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Select a disk:").pack(anchor="w", padx=8, pady=(8, 0))
+
+        listbox = tk.Listbox(dialog, activestyle="dotbox")
+        listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        for d in disks:
+            pct = (d.used / d.total * 100) if d.total else 0
+            listbox.insert(
+                tk.END,
+                f"{d.name}   {human_size(d.used)} / {human_size(d.total)} used ({pct:.0f}%)",
+            )
+        if disks:
+            listbox.selection_set(0)
+
+        def confirm(event=None):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            chosen = disks[sel[0]]
+            dialog.destroy()
+            self.start_scan(chosen.path)
+
+        def cancel():
+            dialog.destroy()
+            if self.current is None:
+                self.root.destroy()
+
+        listbox.bind("<Double-Button-1>", confirm)
+        listbox.bind("<Return>", confirm)
+
+        btns = ttk.Frame(dialog)
+        btns.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Button(btns, text="Scan", command=confirm).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Cancel", command=cancel).pack(side=tk.RIGHT, padx=(0, 6))
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        listbox.focus_set()
 
     def start_scan(self, path: str):
         self.status.config(text=f"Scanning {path} ...")

@@ -5,7 +5,9 @@ die laat zien waar je schijfruimte heen gaat.
 
 ## Features
 
-- Recursieve scan van een map of schijf (loopt in een achtergrondthread,
+- Kies bij het opstarten een schijf/drive uit een lijst (drive letters op
+  Windows, mount points op Linux/macOS) - geen folder-browser
+- Recursieve scan van de gekozen schijf (loopt in een achtergrondthread,
   UI blijft responsief)
 - Squarified treemap layout (Bruls et al., 1999) - zelfgeschreven, geen
   externe dependency nodig
@@ -25,16 +27,17 @@ Geen pip-dependencies nodig.
 ## Gebruik
 
 ```bash
-python main.py                # opent een folder-picker
-python main.py /pad/naar/map  # scant direct die map
-python main.py C:\            # Windows: scan een hele schijf
+python main.py                # opent een disk-picker
+python main.py /pad/naar/map  # scant direct dat pad (optioneel, bv. voor scripting)
+python main.py C:\            # Windows: scan direct een schijf
 ```
 
 ## Bestanden
 
+- `disks.py` - schijf/drive-detectie (Windows drive letters, Linux/macOS mount points via /proc/mounts)
 - `scanner.py` - recursieve schijfscan naar een Node-boom
 - `treemap.py` - squarified treemap layout algoritme (puur Python)
-- `main.py` - Tkinter GUI die scanner + treemap samenbrengt
+- `main.py` - Tkinter GUI die disk-picker + scanner + treemap samenbrengt
 
 ## Bekende beperkingen
 
