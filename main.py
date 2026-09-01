@@ -20,8 +20,8 @@ Rendering:
       of a size and get a hatched fill.
 
 Controls:
-    - Click any block (file or folder, at any depth) - directories zoom
-      in, replacing the view with that folder's contents.
+    - Click a directory block (any depth) to zoom into it.
+    - Click a file block to open it with the OS default application.
     - "Back" / Backspace to go up one level.
     - Hover over a block to see its full path and size in the status bar.
     - "Rescan" to re-scan the current root from disk.
@@ -38,6 +38,7 @@ from __future__ import annotations
 import colorsys
 import hashlib
 import os
+import subprocess
 import sys
 import time
 import threading
@@ -569,8 +570,25 @@ class DiskscapeApp:
 
     def on_click(self, event):
         node = self._node_at(event.x, event.y)
-        if node:
+        if not node:
+            return
+        if node.is_dir:
             self.zoom_into(node)
+        else:
+            self.open_file(node)
+
+    def open_file(self, node: Node):
+        """Open a file with whatever the OS considers its default app."""
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(node.path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", node.path])
+            else:
+                subprocess.Popen(["xdg-open", node.path])
+            self.status.config(text=f"Opened: {node.path}")
+        except OSError as e:
+            self.status.config(text=f"Could not open {node.path}: {e}")
 
     def on_hover(self, event):
         node = self._node_at(event.x, event.y)
