@@ -35,7 +35,7 @@ Zoom animation:
 """
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 import colorsys
 import hashlib
@@ -51,6 +51,7 @@ import scanner
 from disks import Disk, list_disks
 from scanner import Node, scan
 from treemap import squarify
+from watcher import HAS_WATCHDOG, DirWatcher
 
 MIN_RECT_SIZE = 2       # px, below this we don't bother drawing at all
 HEADER_H = 15           # px, height of a block's caption strip
@@ -68,6 +69,8 @@ ZOOM_ANIM_FRAME_MS = 16 # ~60fps animation tick
 TOOLTIP_DELAY_MS = 450   # hover time before the tooltip popup appears
 TOOLTIP_OFFSET_X = 16    # px, tooltip position relative to the cursor
 TOOLTIP_OFFSET_Y = 12
+
+RESIZE_DEBOUNCE_MS = 120  # quiet time after the last <Configure> before a full redraw
 
 # Depth-based shading for directory blocks (SpaceMonger/WinDirStat-style:
 # folders get a distinct, consistent hue independent of their name so the
@@ -214,6 +217,12 @@ class DiskscapeApp:
         self._search_matches: list[Node] = []
         self._search_index: int = -1
 
+        self._watcher: DirWatcher | None = None
+        self._watched_path: str | None = None
+        self._watch_pending_rescan = False
+
+        self._resize_job: str | None = None
+
         self._build_ui()
 
         if start_path:
@@ -249,12 +258,15 @@ class DiskscapeApp:
         self.find_btn = ttk.Button(toolbar, text="Find next", command=self.on_search)
         self.find_btn.pack(side=tk.LEFT, padx=(0, 4), pady=4)
 
+        self.watch_label = ttk.Label(toolbar, text="", foreground="#2a8f4a")
+        self.watch_label.pack(side=tk.LEFT, padx=(6, 0))
+
         self.path_label = ttk.Label(toolbar, text="")
         self.path_label.pack(side=tk.LEFT, padx=10)
 
         self.canvas = tk.Canvas(self.root, bg="#1e1e1e", highlightthickness=0)
         self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        self.canvas.bind("<Configure>", lambda e: self.redraw())
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Motion>", self.on_hover)
         self.canvas.bind("<Leave>", self.on_leave)
@@ -274,6 +286,11 @@ class DiskscapeApp:
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
         self.root.bind("<BackSpace>", lambda e: self.go_back())
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        self.stop_watching()
+        self.root.destroy()
 
     def choose_disk(self):
         disks = list_disks()
@@ -340,6 +357,7 @@ class DiskscapeApp:
         self._scan_root_holder = {}
         self._hidden_paths.clear()
         self._update_show_all_state()
+        self.stop_watching()
         self._start_progress_ui(expected_total)
         self._schedule_preview_redraw()
 
@@ -624,6 +642,21 @@ class DiskscapeApp:
             return children
         return [c for c in children if c.path not in self._hidden_paths]
 
+    def _on_canvas_configure(self, event):
+        # A single maximize/resize can fire several <Configure> events in
+        # a row (window manager reporting intermediate geometry steps),
+        # and a full redraw rebuilds every nested treemap rectangle -
+        # potentially thousands of canvas items. Debounce so only the
+        # last event in a burst actually triggers a redraw, instead of
+        # redrawing 2-3x for one resize.
+        if self._resize_job is not None:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(RESIZE_DEBOUNCE_MS, self._resize_tick)
+
+    def _resize_tick(self):
+        self._resize_job = None
+        self.redraw()
+
     def redraw(self):
         self.canvas.delete("all")
         self.rects = []
@@ -826,6 +859,18 @@ class DiskscapeApp:
         menu.add_separator()
         menu.add_command(label="Hide", command=lambda: self.hide_node(node))
 
+        if node.is_dir:
+            menu.add_separator()
+            if self._watched_path == node.path:
+                menu.add_command(label="Stop watching", command=self.stop_watching)
+            elif HAS_WATCHDOG:
+                menu.add_command(label="Watch this folder", command=lambda: self.watch_folder(node))
+            else:
+                menu.add_command(
+                    label="Watch this folder (needs 'watchdog' package)",
+                    command=lambda: self.watch_folder(node),
+                )
+
         self._context_menu = menu
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -856,6 +901,101 @@ class DiskscapeApp:
 
     def _update_show_all_state(self):
         self.show_all_btn.config(state=tk.NORMAL if self._hidden_paths else tk.DISABLED)
+
+    # ---- watch folder -----------------------------------------------------
+
+    def watch_folder(self, node: Node):
+        if not HAS_WATCHDOG:
+            self.status.config(
+                text="Watching requires the 'watchdog' package: pip install watchdog"
+            )
+            return
+        self.stop_watching()  # only one active watch at a time
+
+        try:
+            watcher = DirWatcher(node.path, self._on_watched_change)
+            watcher.start()
+        except OSError as e:
+            self.status.config(text=f"Could not watch {node.path}: {e}")
+            return
+
+        self._watcher = watcher
+        self._watched_path = node.path
+        self.watch_label.config(text=f"\u25cf watching: {node.name}")
+        self.status.config(text=f"Watching for changes: {node.path}")
+
+    def stop_watching(self):
+        if self._watcher is not None:
+            self._watcher.stop()
+            self._watcher = None
+        if self._watched_path is not None:
+            self.status.config(text=f"Stopped watching: {self._watched_path}")
+        self._watched_path = None
+        self.watch_label.config(text="")
+
+    def _on_watched_change(self):
+        # Called from a watchdog background thread (after its own
+        # debounce), so hop onto the Tk main thread before touching any
+        # widget or the scan machinery.
+        self.root.after(0, self._rescan_watched_folder)
+
+    def _rescan_watched_folder(self):
+        if self._watched_path is None:
+            return
+        if self._scanning:
+            # A scan is already in flight (e.g. user hit Rescan): don't
+            # stack a second one, just remember to check again once it's
+            # done via the normal _on_scan_done path implicitly covering it.
+            return
+        watched_path = self._watched_path
+        self.status.config(text=f"Change detected, rescanning: {watched_path}")
+        self._rescan_in_place(watched_path)
+
+    def _rescan_in_place(self, path: str):
+        """Re-scan `path` and splice the fresh Node into the tree in place
+        of the stale one, preserving the current view/zoom/stack instead
+        of resetting navigation back to the scan root (unlike rescan(),
+        which is a user-triggered full restart from the root)."""
+        old_node = None
+        for n, _ in self.stack:
+            if n.path == path:
+                old_node = n
+                break
+        if old_node is None and self.current is not None and self.current.path == path:
+            old_node = self.current
+
+        def worker():
+            fresh_root = scan(path)
+            self.root.after(0, lambda: self._splice_rescanned_node(path, fresh_root))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _splice_rescanned_node(self, path: str, fresh_node: Node):
+        if self._watched_path != path:
+            return  # watch was stopped/changed while the rescan was running
+
+        parent = None
+        for idx, (n, entry_rect) in enumerate(self.stack):
+            if n.path == path:
+                parent_node = self.stack[idx - 1][0] if idx > 0 else None
+                if parent_node is not None:
+                    fresh_node.parent = parent_node
+                    for i, child in enumerate(parent_node.children):
+                        if child.path == path:
+                            parent_node.children[i] = fresh_node
+                            break
+                self.stack[idx] = (fresh_node, entry_rect)
+                parent = parent_node
+                break
+
+        if self.current is not None and self.current.path == path:
+            self.current = fresh_node
+        elif parent is None and self.current is not None:
+            # The watched node wasn't on the current stack path at all
+            # (user zoomed elsewhere) - nothing visible to update.
+            return
+
+        self.redraw()
 
 
 def main():
