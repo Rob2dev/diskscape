@@ -1,61 +1,60 @@
 # diskscape
 
-Een kleine, dependency-vrije disk usage visualizer in Python: een treemap
-die laat zien waar je schijfruimte heen gaat.
+A small, dependency-free disk usage visualizer in Python: a treemap
+that shows where your disk space is going.
 
 ## Features
 
-- Kies bij het opstarten een schijf/drive uit een lijst (drive letters op
-  Windows, mount points op Linux/macOS) - geen folder-browser
-- Parallelle scan: meerdere mappen tegelijk uitgelezen via een
-  thread-pool (I/O-bound syscalls laten de GIL los, dus dit helpt vooral
-  op netwerkschijven of trage disks)
-- Live preview tijdens het scannen: het canvas wordt elke 500ms
-  herbouwd op basis van wat er al bekend is. Mappen die nog niet klaar
-  zijn met scannen krijgen een grijs vlak met "?" in plaats van een
-  grootte, zodat je meteen structuur ziet verschijnen in plaats van naar
-  een lege balk te staren
-- Voortgangsbalk met percentage en ETA tijdens het scannen. Bij een
-  schijf-scan gebruikt hij het bekende "in gebruik"-totaal (via
-  disk_usage) als noemer; bij een los pad zonder bekend totaal toont hij
-  een indeterminate balk met verstreken tijd en bytes gescand
-- Geneste treemap, SpaceMonger/WinDirStat-stijl: submappen worden tot 5
-  niveaus diep getekend binnen hun oudermap (zolang er plaats is), elk
-  met een eigen naam/grootte-caption
-- Elk zichtbaar blok - bestand of map, op elk niveau - is klikbaar: klik
-  om in te zoomen (met een korte groei-animatie naar volledig scherm),
-  Backspace / "Back" om weer terug te krimpen naar de oudermap
-- Kleurcodering: mappen krijgen een vast blauwtintje per nesting-diepte
-  (zoals SpaceMonger), bestanden krijgen een verzadigde, over de hele
-  kleurencirkel gespreide kleur per extensie (stabiel per type)
-- Hover toont volledig pad + grootte in de statusbalk
-- "Rescan" om opnieuw te scannen na wijzigingen op schijf
+- Pick a disk/drive from a list at startup (drive letters on Windows,
+  mount points on Linux/macOS) - no folder browser
+- Parallel scan: multiple directories read concurrently via a
+  thread pool (I/O-bound syscalls release the GIL, so this helps
+  mainly on network drives or slow disks)
+- Live preview while scanning: the canvas is rebuilt every 500ms
+  from whatever is known so far. Directories that haven't finished
+  scanning yet show a grey block with "?" instead of a size, so you
+  see structure appear immediately instead of staring at an empty bar
+- Progress bar with percentage and ETA during the scan. For a
+  whole-disk scan it uses the known "used" total (via disk_usage) as
+  the denominator; for a plain path with no known total it shows an
+  indeterminate bar with elapsed time and bytes scanned
+- Nested treemap, SpaceMonger/WinDirStat-style: subfolders are drawn
+  up to 5 levels deep inside their parent folder (as long as there's
+  room), each with its own name/size caption
+- Every visible block - file or folder, at any level - is clickable:
+  click to zoom in (with a short grow animation), Backspace / "Back"
+  to shrink back to the parent folder
+- Color coding: folders get a fixed shade of blue per nesting depth
+  (like SpaceMonger), files get a saturated color spread across the
+  full color wheel per extension (stable per type)
+- Hovering shows the full path + size in the status bar
+- "Rescan" to re-scan after changes on disk
 
-## Vereisten
+## Requirements
 
 - Python 3.9+
-- Tkinter (zit standaard bij Python op Windows/macOS; op Linux soms
-  apart pakket: `sudo apt install python3-tk`)
+- Tkinter (bundled with Python on Windows/macOS; on Linux sometimes a
+  separate package: `sudo apt install python3-tk`)
 
-Geen pip-dependencies nodig.
+No pip dependencies required.
 
-## Gebruik
+## Usage
 
 ```bash
-python main.py                # opent een disk-picker
-python main.py /pad/naar/map  # scant direct dat pad (optioneel, bv. voor scripting)
-python main.py C:\            # Windows: scan direct een schijf
+python main.py                # opens a disk picker
+python main.py /path/to/dir   # scans that path directly (optional, e.g. for scripting)
+python main.py C:\            # Windows: scan a drive directly
 ```
 
-## Bestanden
+## Files
 
-- `disks.py` - schijf/drive-detectie (Windows drive letters, Linux/macOS mount points via /proc/mounts)
-- `scanner.py` - recursieve schijfscan naar een Node-boom
-- `treemap.py` - squarified treemap layout algoritme (puur Python)
-- `main.py` - Tkinter GUI die disk-picker + scanner + treemap samenbrengt
+- `disks.py` - disk/drive detection (Windows drive letters, Linux/macOS mount points via /proc/mounts)
+- `scanner.py` - recursive disk scan into a Node tree
+- `treemap.py` - squarified treemap layout algorithm (pure Python)
+- `main.py` - Tkinter GUI that ties the disk picker + scanner + treemap together
 
-## Bekende beperkingen
+## Known limitations
 
-- Symlinks worden overgeslagen (voorkomt dubbeltelling / oneindige loops)
-- Zeer kleine bestanden/mappen (< 2px in de layout) worden niet getekend
-- Geen delete-functionaliteit (bewust: dit is een viewer, geen cleaner)
+- Symlinks are skipped (avoids double-counting / infinite loops)
+- Very small files/folders (< 2px in the layout) are not drawn
+- No delete functionality (by design: this is a viewer, not a cleaner)
