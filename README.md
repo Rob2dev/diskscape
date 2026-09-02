@@ -30,9 +30,10 @@ your disk space is going.
 - Color coding: folders get a fixed shade of blue per nesting depth
   (like SpaceMonger), files get a saturated color spread across the
   full color wheel per extension (stable per type)
-- Hovering shows the full path + size in the status bar, and after a
-  short delay a tooltip popup with name, path, type, size and item
-  count (for folders)
+- Hovering shows the full path + size in the status bar, draws a bright
+  outline around the folder block under the cursor for clear visual
+  feedback, and after a short delay shows a tooltip popup with name,
+  path, type, size and item count (for folders)
 - Right-click a block for a context menu: open / zoom in, open
   containing folder, copy path/name/size, hide, watch/stop watching
 - "Hide" a block via the context menu to declutter a view; "Show all"

@@ -35,7 +35,7 @@ Zoom animation:
 """
 from __future__ import annotations
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 import colorsys
 import hashlib
@@ -69,6 +69,9 @@ ZOOM_ANIM_FRAME_MS = 16 # ~60fps animation tick
 TOOLTIP_DELAY_MS = 450   # hover time before the tooltip popup appears
 TOOLTIP_OFFSET_X = 16    # px, tooltip position relative to the cursor
 TOOLTIP_OFFSET_Y = 12
+
+HOVER_OUTLINE_COLOR = "#ffffff"
+HOVER_OUTLINE_WIDTH = 2
 
 RESIZE_DEBOUNCE_MS = 120  # quiet time after the last <Configure> before a full redraw
 
@@ -211,6 +214,8 @@ class DiskscapeApp:
         self._tooltip_node: Node | None = None
         self._context_menu: tk.Menu | None = None
         self._context_node: Node | None = None
+        self._hover_node: Node | None = None
+        self._hover_highlight_id: int | None = None
         self._hidden_paths: set[str] = set()
 
         self._search_query: str = ""
@@ -603,6 +608,8 @@ class DiskscapeApp:
 
             self.canvas.delete("all")
             self.rects = []
+            self._hover_node = None
+            self._hover_highlight_id = None
             x, y, w, h = rect
             if w > 4 and h > 4:
                 self._layout_and_draw_children(content_node, x, y, w, h, depth=0)
@@ -660,6 +667,8 @@ class DiskscapeApp:
     def redraw(self):
         self.canvas.delete("all")
         self.rects = []
+        self._hover_node = None
+        self._hover_highlight_id = None
         if self.current is None:
             return
 
@@ -778,6 +787,8 @@ class DiskscapeApp:
             size_text = human_size(node.size) if (node.scanned or not node.is_dir) else "? (scanning)"
             self.status.config(text=f"[{kind}] {node.path}  -  {size_text}")
 
+        self._update_hover_highlight(node)
+
         if node is not self._tooltip_node:
             self._hide_tooltip()
             self._tooltip_node = node
@@ -789,9 +800,40 @@ class DiskscapeApp:
             # Tooltip already showing for this node: just follow the cursor.
             self._position_tooltip(event.x_root, event.y_root)
 
+    def _update_hover_highlight(self, node: Node | None):
+        """Draw a bright outline around the folder block under the cursor
+        so hovering gives clear visual feedback, on top of the status bar
+        text and tooltip. Only directories are highlighted (files just
+        get the tooltip/status bar - there's nothing to zoom/navigate
+        into on a file, so an outline there would be misleading)."""
+        if node is self._hover_node:
+            return
+        self._hover_node = node
+
+        if self._hover_highlight_id is not None:
+            self.canvas.delete(self._hover_highlight_id)
+            self._hover_highlight_id = None
+
+        if node is None or not node.is_dir:
+            return
+
+        rect = self._rect_of(node)
+        if rect is None:
+            return
+        x, y, w, h = rect
+        # Inset slightly so the highlight doesn't get clipped against the
+        # block's own outline / a nested child's outline drawn right at
+        # the edge.
+        inset = HOVER_OUTLINE_WIDTH / 2
+        self._hover_highlight_id = self.canvas.create_rectangle(
+            x + inset, y + inset, x + w - inset, y + h - inset,
+            outline=HOVER_OUTLINE_COLOR, width=HOVER_OUTLINE_WIDTH,
+        )
+
     def on_leave(self, event):
         self._hide_tooltip()
         self._tooltip_node = None
+        self._update_hover_highlight(None)
 
     def _show_tooltip(self, node: Node, x_root: int, y_root: int):
         self._tooltip_job = None
