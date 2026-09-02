@@ -35,6 +35,8 @@ Zoom animation:
 """
 from __future__ import annotations
 
+__version__ = "0.3.0"
+
 import colorsys
 import hashlib
 import os
@@ -62,6 +64,10 @@ PREVIEW_REDRAW_MS = 500      # full canvas redraw rate while a scan is running
 
 ZOOM_ANIM_MS = 220      # total duration of a zoom in/out animation
 ZOOM_ANIM_FRAME_MS = 16 # ~60fps animation tick
+
+TOOLTIP_DELAY_MS = 450   # hover time before the tooltip popup appears
+TOOLTIP_OFFSET_X = 16    # px, tooltip position relative to the cursor
+TOOLTIP_OFFSET_Y = 12
 
 # Depth-based shading for directory blocks (SpaceMonger/WinDirStat-style:
 # folders get a distinct, consistent hue independent of their name so the
@@ -140,6 +146,21 @@ def color_for(node: Node, depth: int = 0) -> str:
     return color_for_file(node.name)
 
 
+def text_color_for_bg(hex_color: str) -> str:
+    """Pick black or white label text based on background luminance.
+
+    Fixed white text is unreadable on light/high-value fills - most
+    noticeably the yellow-ish hues from color_for_file(). Using relative
+    luminance (perceptual weighting, not a flat average) picks whichever
+    of black/white gives better contrast against any fill color.
+    """
+    r = int(hex_color[1:3], 16) / 255.0
+    g = int(hex_color[3:5], 16) / 255.0
+    b = int(hex_color[5:7], 16) / 255.0
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    return "#111111" if luminance > 0.6 else "#ffffff"
+
+
 def sizes_with_placeholders(children: list[Node]) -> list[float]:
     """Layout sizes for `children`, substituting a nominal size for
     directories that have no data yet (not scanned, size==0) so they
@@ -157,7 +178,7 @@ PROGRESS_POLL_MS = PROGRESS_POLL_MS  # keep name stable for readability below
 class DiskscapeApp:
     def __init__(self, root: tk.Tk, start_path: str | None):
         self.root = root
-        self.root.title("diskscape")
+        self.root.title(f"diskscape v{__version__}")
         self.root.geometry("1100x700")
 
         # Navigation stack: list of (node, entry_rect). entry_rect is the
@@ -182,6 +203,13 @@ class DiskscapeApp:
         self._scan_start_time: float = 0.0
         self._scanning = False
 
+        self._tooltip_win: tk.Toplevel | None = None
+        self._tooltip_job: str | None = None
+        self._tooltip_node: Node | None = None
+        self._context_menu: tk.Menu | None = None
+        self._context_node: Node | None = None
+        self._hidden_paths: set[str] = set()
+
         self._build_ui()
 
         if start_path:
@@ -202,6 +230,9 @@ class DiskscapeApp:
         ttk.Button(toolbar, text="Rescan", command=self.rescan).pack(
             side=tk.LEFT, padx=4, pady=4
         )
+        self.show_all_btn = ttk.Button(toolbar, text="Show all", command=self.show_all_hidden)
+        self.show_all_btn.pack(side=tk.LEFT, padx=4, pady=4)
+        self.show_all_btn.config(state=tk.DISABLED)
 
         self.path_label = ttk.Label(toolbar, text="")
         self.path_label.pack(side=tk.LEFT, padx=10)
@@ -211,6 +242,8 @@ class DiskscapeApp:
         self.canvas.bind("<Configure>", lambda e: self.redraw())
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Motion>", self.on_hover)
+        self.canvas.bind("<Leave>", self.on_leave)
+        self.canvas.bind("<Button-3>", self.on_right_click)
 
         self.progress_frame = ttk.Frame(self.root)
         self.progress_bar = ttk.Progressbar(
@@ -290,6 +323,8 @@ class DiskscapeApp:
         self.canvas.delete("all")
         self._scanning = True
         self._scan_root_holder = {}
+        self._hidden_paths.clear()
+        self._update_show_all_state()
         self._start_progress_ui(expected_total)
         self._schedule_preview_redraw()
 
@@ -490,12 +525,22 @@ class DiskscapeApp:
         node.children, so go through scanner.snapshot_children() with the
         scan's shared lock. Once scanning is finished the tree is static
         and a plain list() copy is enough.
+
+        Children whose path is in self._hidden_paths (hidden via the
+        context menu) are filtered out here, so hiding is a pure view
+        concern and never touches the scanned Node tree itself.
         """
         if self._scanning:
             lock = self._scan_root_holder.get("lock")
             if lock is not None:
-                return scanner.snapshot_children(node, lock)
-        return list(node.children)
+                children = scanner.snapshot_children(node, lock)
+            else:
+                children = list(node.children)
+        else:
+            children = list(node.children)
+        if not self._hidden_paths:
+            return children
+        return [c for c in children if c.path not in self._hidden_paths]
 
     def redraw(self):
         self.canvas.delete("all")
@@ -542,7 +587,7 @@ class DiskscapeApp:
             else:
                 label = f"{node.name}  {human_size(node.size)}"
             self.canvas.create_text(
-                x + 4, y + 2, text=label, anchor="nw", fill="white",
+                x + 4, y + 2, text=label, anchor="nw", fill=text_color_for_bg(color),
                 font=("TkDefaultFont", 8), width=max(w - 8, 10),
             )
 
@@ -590,12 +635,145 @@ class DiskscapeApp:
         except OSError as e:
             self.status.config(text=f"Could not open {node.path}: {e}")
 
+    def open_containing_folder(self, node: Node):
+        """Open the OS file browser at the folder containing `node`."""
+        folder = node.path if node.is_dir else os.path.dirname(node.path)
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(folder)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+            self.status.config(text=f"Opened folder: {folder}")
+        except OSError as e:
+            self.status.config(text=f"Could not open {folder}: {e}")
+
+    def copy_to_clipboard(self, text: str, label: str = "Value"):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status.config(text=f"{label} copied to clipboard: {text}")
+
+    # ---- hover tooltip --------------------------------------------------
+
     def on_hover(self, event):
         node = self._node_at(event.x, event.y)
         if node:
             kind = "dir" if node.is_dir else "file"
             size_text = human_size(node.size) if (node.scanned or not node.is_dir) else "? (scanning)"
             self.status.config(text=f"[{kind}] {node.path}  -  {size_text}")
+
+        if node is not self._tooltip_node:
+            self._hide_tooltip()
+            self._tooltip_node = node
+            if node is not None:
+                self._tooltip_job = self.root.after(
+                    TOOLTIP_DELAY_MS, lambda: self._show_tooltip(node, event.x_root, event.y_root)
+                )
+        elif self._tooltip_win is not None:
+            # Tooltip already showing for this node: just follow the cursor.
+            self._position_tooltip(event.x_root, event.y_root)
+
+    def on_leave(self, event):
+        self._hide_tooltip()
+        self._tooltip_node = None
+
+    def _show_tooltip(self, node: Node, x_root: int, y_root: int):
+        self._tooltip_job = None
+        if self._tooltip_node is not node:
+            return  # stale (cursor moved to a different block before the delay fired)
+
+        self._hide_tooltip()
+        win = tk.Toplevel(self.root)
+        win.wm_overrideredirect(True)
+        win.wm_attributes("-topmost", True)
+
+        kind = "Folder" if node.is_dir else "File"
+        size_text = human_size(node.size) if (node.scanned or not node.is_dir) else "? (scanning)"
+        lines = [node.name, node.path, f"{kind} - {size_text}"]
+        if node.is_dir:
+            count = len(node.children)
+            lines.append(f"{count} item{'s' if count != 1 else ''}" + ("" if node.scanned else " so far"))
+
+        label = tk.Label(
+            win, text="\n".join(lines), justify="left", anchor="w",
+            background="#ffffe0", foreground="#111111",
+            relief="solid", borderwidth=1,
+            font=("TkDefaultFont", 8), padx=6, pady=4,
+        )
+        label.pack()
+
+        self._tooltip_win = win
+        self._position_tooltip(x_root, y_root)
+
+    def _position_tooltip(self, x_root: int, y_root: int):
+        if self._tooltip_win is not None:
+            self._tooltip_win.wm_geometry(
+                f"+{x_root + TOOLTIP_OFFSET_X}+{y_root + TOOLTIP_OFFSET_Y}"
+            )
+
+    def _hide_tooltip(self):
+        if self._tooltip_job is not None:
+            self.root.after_cancel(self._tooltip_job)
+            self._tooltip_job = None
+        if self._tooltip_win is not None:
+            self._tooltip_win.destroy()
+            self._tooltip_win = None
+
+    # ---- right-click context menu ---------------------------------------
+
+    def on_right_click(self, event):
+        node = self._node_at(event.x, event.y)
+        if not node:
+            return
+        self._hide_tooltip()
+        self._tooltip_node = None
+        self._context_node = node
+
+        menu = tk.Menu(self.root, tearoff=0)
+        if node.is_dir:
+            menu.add_command(label="Zoom in", command=lambda: self.zoom_into(node))
+        else:
+            menu.add_command(label="Open", command=lambda: self.open_file(node))
+        menu.add_command(label="Open containing folder", command=lambda: self.open_containing_folder(node))
+        menu.add_separator()
+        menu.add_command(label="Copy path", command=lambda: self.copy_to_clipboard(node.path, "Path"))
+        menu.add_command(label="Copy name", command=lambda: self.copy_to_clipboard(node.name, "Name"))
+        size_text = human_size(node.size) if (node.scanned or not node.is_dir) else "? (scanning)"
+        menu.add_command(label="Copy size", command=lambda: self.copy_to_clipboard(size_text, "Size"))
+        menu.add_separator()
+        menu.add_command(label="Hide", command=lambda: self.hide_node(node))
+
+        self._context_menu = menu
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def hide_node(self, node: Node):
+        """Hide `node` from the treemap without touching the scanned tree.
+
+        Purely a view-layer filter (see _children_of) - a Rescan or a
+        fresh scan naturally starts unhidden again since it builds a new
+        Node tree with different objects, but "Show all" also clears it
+        explicitly for the current tree.
+        """
+        self._hidden_paths.add(node.path)
+        self._update_show_all_state()
+        self.status.config(text=f"Hidden: {node.path}")
+        self.redraw()
+
+    def show_all_hidden(self):
+        if not self._hidden_paths:
+            return
+        count = len(self._hidden_paths)
+        self._hidden_paths.clear()
+        self._update_show_all_state()
+        self.status.config(text=f"Unhid {count} item{'s' if count != 1 else ''}.")
+        self.redraw()
+
+    def _update_show_all_state(self):
+        self.show_all_btn.config(state=tk.NORMAL if self._hidden_paths else tk.DISABLED)
 
 
 def main():
