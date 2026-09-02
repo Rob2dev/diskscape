@@ -35,7 +35,7 @@ Zoom animation:
 """
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 import colorsys
 import hashlib
@@ -210,6 +210,10 @@ class DiskscapeApp:
         self._context_node: Node | None = None
         self._hidden_paths: set[str] = set()
 
+        self._search_query: str = ""
+        self._search_matches: list[Node] = []
+        self._search_index: int = -1
+
         self._build_ui()
 
         if start_path:
@@ -233,6 +237,17 @@ class DiskscapeApp:
         self.show_all_btn = ttk.Button(toolbar, text="Show all", command=self.show_all_hidden)
         self.show_all_btn.pack(side=tk.LEFT, padx=4, pady=4)
         self.show_all_btn.config(state=tk.DISABLED)
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=4)
+
+        ttk.Label(toolbar, text="Find folder:").pack(side=tk.LEFT, padx=(0, 4))
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(toolbar, textvariable=self.search_var, width=22)
+        self.search_entry.pack(side=tk.LEFT, padx=(0, 4), pady=4)
+        self.search_entry.bind("<Return>", self.on_search)
+        self.search_entry.bind("<KeyRelease>", self._on_search_text_changed)
+        self.find_btn = ttk.Button(toolbar, text="Find next", command=self.on_search)
+        self.find_btn.pack(side=tk.LEFT, padx=(0, 4), pady=4)
 
         self.path_label = ttk.Label(toolbar, text="")
         self.path_label.pack(side=tk.LEFT, padx=10)
@@ -443,6 +458,73 @@ class DiskscapeApp:
     def rescan(self):
         if self.stack:
             self.start_scan(self.stack[0][0].path)
+
+    # ---- folder search ---------------------------------------------------
+
+    def _on_search_text_changed(self, event=None):
+        # Invalidate the cached match list so the next Enter/Find-next
+        # recomputes it against the new query instead of reusing stale
+        # matches from a previous search term.
+        self._search_query = ""
+
+    def on_search(self, event=None):
+        query = self.search_var.get().strip()
+        if not query:
+            self.status.config(text="Type a folder name to search for.")
+            return
+
+        query_lower = query.lower()
+        if query_lower != self._search_query:
+            root_node = self.stack[0][0] if self.stack else self.current
+            if root_node is None:
+                return
+            self._search_query = query_lower
+            self._search_matches = self._find_dir_matches(root_node, query_lower)
+            self._search_index = -1
+
+        if not self._search_matches:
+            self.status.config(text=f"No folder found matching '{query}'.")
+            return
+
+        self._search_index = (self._search_index + 1) % len(self._search_matches)
+        target = self._search_matches[self._search_index]
+        self._goto_node(target)
+        self.status.config(
+            text=f"Match {self._search_index + 1}/{len(self._search_matches)}: {target.path}"
+        )
+
+    def _find_dir_matches(self, root: Node, query_lower: str) -> list[Node]:
+        """Depth-first search of every directory under `root` (root
+        included) whose name contains `query_lower`, case-insensitive."""
+        matches: list[Node] = []
+        if query_lower in root.name.lower():
+            matches.append(root)
+        pending = [root]
+        while pending:
+            node = pending.pop()
+            for child in self._children_of(node):
+                if not child.is_dir:
+                    continue
+                if query_lower in child.name.lower():
+                    matches.append(child)
+                pending.append(child)
+        matches.sort(key=lambda n: n.path)
+        return matches
+
+    def _goto_node(self, node: Node):
+        """Jump the view directly to `node` (a directory), rebuilding the
+        navigation stack from the root down to it. This is a hard cut,
+        not an animated zoom - fine for "jump to search result", and Back
+        already handles a stack entry with entry_rect=None as a plain cut."""
+        path_nodes: list[Node] = []
+        n: Node | None = node
+        while n is not None:
+            path_nodes.append(n)
+            n = n.parent
+        path_nodes.reverse()
+        self.stack = [(pn, None) for pn in path_nodes]
+        self.current = node
+        self.redraw()
 
     def go_back(self):
         if len(self.stack) <= 1 or self._animating:
